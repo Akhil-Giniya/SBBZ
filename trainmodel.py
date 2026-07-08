@@ -10,6 +10,7 @@ Usage:
     python train_model.py
 """
 
+import json
 import logging
 import joblib
 import numpy as np
@@ -20,6 +21,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error, precision_score, recall_score
 
 DATASET_PATH = Path("data/training_dataset.parquet")
+METADATA_PATH = Path("data/training_metadata.json")
 MODEL_PATH = Path("data/flip_model.joblib")
 
 # Fraction of the time range held out as a test set. This MUST be a time
@@ -28,21 +30,24 @@ MODEL_PATH = Path("data/flip_model.joblib")
 # and produces a model that looks great here and fails in production.
 TEST_FRACTION = 0.15
 
-# Columns the model is not allowed to see: identifiers, and anything that
-# depends on the future (both target variants -- is_profitable is derived
-# from profit_margin_target, so it leaks the answer just as badly if left
-# in as a feature).
-NON_FEATURE_COLUMNS = ["timestamp", "product", "profit_margin_target", "is_profitable"]
+# Columns the model is not allowed to see.
+# Note: 'product' is NO LONGER excluded; it will be cast to a categorical dtype.
+NON_FEATURE_COLUMNS = [
+    "timestamp",
+    "profit_margin_target",
+    "is_profitable",
+    "target_time_horizon_sec"  # Prevent future time-gap leakage
+]
 
 # --- Trading realism config ---
-# MIN_PROFIT_THRESHOLD: don't trade at all if nothing clears this bar, even
-# if it's the "best available" option -- the best of a bad set is still bad.
-# HOLDING_PERIOD_MINUTES: must match HORIZON_STEPS in prepare_training_data.py
-# (15 steps * 60s poll = 15 min) -- this is how long a position's capital
-# stays locked up before it can be reinvested.
 MIN_PROFIT_THRESHOLD = 0.01
-PROB_THRESHOLD = 0.5  # classifier's minimum "this will be profitable" confidence to trade at all
-HOLDING_PERIOD_MINUTES = 15
+PROB_THRESHOLD = 0.5
+
+# Explicitly separate steps (for metadata cross-checking) from time (for embargo calculation)
+HORIZON_STEPS = 15
+ASSUMED_POLL_INTERVAL_SEC = 60
+HOLDING_PERIOD_MINUTES = (HORIZON_STEPS * ASSUMED_POLL_INTERVAL_SEC) / 60.0
+
 POSITION_SIZE = 1_000.0
 MAX_CONCURRENT_POSITIONS = 10
 STARTING_CAPITAL = 10_000.0
@@ -54,13 +59,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("train_model")
 
-
+# Note for V2 Architecture: This uses a single time-based split for a baseline evaluation.
+# For production-grade confidence, replace this with Walk-Forward Validation
+# (retraining on rolling time windows) to evaluate model stability over shifting meta states.
 def time_based_split(df: pd.DataFrame):
     df = df.sort_values("timestamp")
     cutoff_index = int(len(df) * (1 - TEST_FRACTION))
     cutoff_time = df.iloc[cutoff_index]["timestamp"]
-    train = df[df["timestamp"] < cutoff_time]
+
+    # Embargo/Purge gap to prevent cross-split leakage.
+    horizon_buffer = pd.Timedelta(minutes=HOLDING_PERIOD_MINUTES)
+
+    train = df[df["timestamp"] < (cutoff_time - horizon_buffer)]
     test = df[df["timestamp"] >= cutoff_time]
+
+    if train.empty or test.empty:
+        raise RuntimeError(f"Dataset too small after time split. Train size: {len(train)}, Test size: {len(test)}.")
+
     return train, test, cutoff_time
 
 
@@ -116,7 +131,6 @@ def evaluate_ranking(test_df: pd.DataFrame, predictions: np.ndarray, top_k: int 
 
 
 def realistic_backtest(test_df: pd.DataFrame, predictions: np.ndarray,
-                        holding_period_minutes: float = HOLDING_PERIOD_MINUTES,
                         min_profit_threshold: float = MIN_PROFIT_THRESHOLD,
                         position_size: float = POSITION_SIZE,
                         max_concurrent_positions: int = MAX_CONCURRENT_POSITIONS,
@@ -125,23 +139,9 @@ def realistic_backtest(test_df: pd.DataFrame, predictions: np.ndarray,
                         prob_threshold: float = PROB_THRESHOLD):
     """
     Walks through the test set in chronological order with a fixed pool of
-    capital, simulating what would have actually happened: capital used to
-    open a position is locked up until holding_period_minutes later, only
-    max_concurrent_positions can be open at once, and a trade is only taken
-    if there's capital free to take it, and (if classifier_proba is given)
-    only if the classifier is confident enough it'll be profitable at all.
-
-    Also tracks an equity curve (account value over time: free cash + capital
-    still tied up in open positions) and the max drawdown from that curve --
-    the biggest peak-to-trough dip, which an average return figure hides
-    completely. A strategy can have a good average return and still have
-    wiped out most of its capital at some point along the way; drawdown is
-    what surfaces that.
-
-    Note: this assumes you always get filled at the target price and can
-    always find a counterparty at that price -- it doesn't model order-book
-    competition. Treat the output as an upper bound on realistic returns,
-    not a guarantee.
+    capital, simulating what would have actually happened.
+    Capital used to open a position is dynamically locked up based on the
+    actual real-world time elapsed to the target row.
     """
     eval_df = test_df.copy()
     eval_df["predicted"] = predictions
@@ -173,8 +173,12 @@ def realistic_backtest(test_df: pd.DataFrame, predictions: np.ndarray,
             if len(open_positions) >= max_concurrent_positions or capital < position_size:
                 break
             capital -= position_size
+
+            # Dynamically lock up capital based on actual elapsed time to horizon
+            hold_time = pd.to_timedelta(row["target_time_horizon_sec"], unit="s")
+
             open_positions.append({
-                "close_time": timestamp + pd.Timedelta(minutes=holding_period_minutes),
+                "close_time": timestamp + hold_time,
                 "capital_committed": position_size,
                 "profit_margin": row["profit_margin_target"],
             })
@@ -204,9 +208,48 @@ def realistic_backtest(test_df: pd.DataFrame, predictions: np.ndarray,
 
 
 def main():
+    # --- Config Drift Check ---
+    if METADATA_PATH.exists():
+        try:
+            with open(METADATA_PATH, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+
+            meta_horizon = metadata.get("horizon_steps")
+            if meta_horizon and meta_horizon != HORIZON_STEPS:
+                log.warning(
+                    f"Config Drift Detected: Local HORIZON_STEPS ({HORIZON_STEPS}) "
+                    f"doesn't match horizon_steps in metadata ({meta_horizon}). "
+                    f"Embargo gap calculation may be stale."
+                )
+        except Exception as e:
+            log.warning(f"Could not read metadata for config drift check: {e}")
+
     log.info(f"Loading {DATASET_PATH} ...")
     df = pd.read_parquet(DATASET_PATH)
     log.info(f"Loaded {len(df):,} rows.")
+
+    # --- Feature Engineering Enhancements ---
+
+    # 1. Native Categorical Encoding
+    # Allows the model to learn product-specific baseline biases natively.
+    if "product" in df.columns:
+        df["product"] = df["product"].astype("category")
+
+    # 2. Cyclical Temporal Encoding
+    # Projects time onto a circle so 23:00 and 00:00 are recognized as adjacent.
+    if "hour" in df.columns:
+        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+        df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+        NON_FEATURE_COLUMNS.append("hour")  # Drop raw ordinal column
+
+    if "day_of_week" in df.columns:
+        df["day_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7)
+        df["day_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7)
+        NON_FEATURE_COLUMNS.append("day_of_week")  # Drop raw ordinal column
+
+    # Note: Optional API features (e.g., buy_orders, buy_moving_week) may contain NaNs.
+    # We explicitly do NOT drop or impute them. HistGradientBoosting natively handles
+    # missing values by learning them as informative directional splits.
 
     feature_columns = [c for c in df.columns if c not in NON_FEATURE_COLUMNS]
     log.info(f"Using {len(feature_columns)} features: {feature_columns}")
@@ -223,6 +266,7 @@ def main():
         learning_rate=0.05,
         max_depth=6,
         random_state=42,
+        categorical_features="from_dtype"  # Detects the pandas 'category' dtype automatically
     )
     log.info("Training regressor...")
     model.fit(X_train, y_train)
@@ -236,13 +280,20 @@ def main():
         learning_rate=0.05,
         max_depth=6,
         random_state=42,
+        categorical_features="from_dtype"
     )
     log.info("Training classifier (is_profitable)...")
     classifier.fit(X_train, y_train_clf)
     classifier_proba = classifier.predict_proba(X_test)[:, 1]
+
     classifier_pred = (classifier_proba > PROB_THRESHOLD).astype(int)
-    log.info(f"Classifier precision: {precision_score(y_test_clf, classifier_pred):.4f} | "
-             f"recall: {recall_score(y_test_clf, classifier_pred):.4f} "
+
+    # Handle zero division cleanly if no predictions meet the threshold
+    precision = precision_score(y_test_clf, classifier_pred, zero_division=0)
+    recall = recall_score(y_test_clf, classifier_pred, zero_division=0)
+
+    log.info(f"Classifier precision: {precision:.4f} | "
+             f"recall: {recall:.4f} "
              f"(at prob_threshold={PROB_THRESHOLD})")
 
     ranking_results = evaluate_ranking(test_df, predictions, top_k=5, classifier_proba=classifier_proba)
